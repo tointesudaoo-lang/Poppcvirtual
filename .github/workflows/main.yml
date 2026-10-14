@@ -1,0 +1,209 @@
+name: Windows RDP
+
+on:
+workflow_dispatch:
+
+permissions:
+contents: read
+
+jobs:
+remote-windows:
+runs-on: windows-latest
+timeout-minutes: 360
+
+steps:
+  - name: Configure RDP
+    shell: powershell
+    run: |
+      $ErrorActionPreference = "Stop"
+
+      Write-Host "Configurando RDP..."
+
+      Set-ItemProperty `
+        -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server" `
+        -Name "fDenyTSConnections" `
+        -Value 0
+
+      Set-Service -Name TermService -StartupType Automatic
+      Start-Service -Name TermService
+
+      Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
+
+      # Reduz efeitos visuais e prioriza desempenho
+      powercfg /setactive SCHEME_MIN
+
+      # Desativa efeitos de transparência na tela de login/perfil padrão
+      $VisualPath = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\VisualEffects"
+      New-Item -Path $VisualPath -Force | Out-Null
+      Set-ItemProperty -Path $VisualPath `
+        -Name VisualFXSetting -Value 2 -Type DWord
+
+      $PersonalizePath = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize"
+      New-Item -Path $PersonalizePath -Force | Out-Null
+      Set-ItemProperty -Path $PersonalizePath `
+        -Name EnableTransparency -Value 0 -Type DWord
+
+      # Desativa animações de janelas
+      $DesktopPath = "HKCU:\Control Panel\Desktop"
+      Set-ItemProperty -Path $DesktopPath `
+        -Name MinAnimate -Value "0"
+
+      Write-Host "RDP configurado."
+
+  - name: Create RDP Account
+    shell: powershell
+    env:
+      RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+    run: |
+      $ErrorActionPreference = "Stop"
+
+      $Username = "RemoteUser"
+      $Password = $env:RDP_PASSWORD
+
+      if ([string]::IsNullOrWhiteSpace($Password)) {
+        throw "Configure o GitHub Secret RDP_PASSWORD antes de iniciar."
+      }
+
+      $SecurePassword = ConvertTo-SecureString `
+        $Password -AsPlainText -Force
+
+      $OldUser = Get-LocalUser -Name $Username `
+        -ErrorAction SilentlyContinue
+
+      if ($OldUser) {
+        Set-LocalUser -Name $Username -Password $SecurePassword
+        Enable-LocalUser -Name $Username
+      } else {
+        New-LocalUser `
+          -Name $Username `
+          -Password $SecurePassword `
+          -Description "GitHub RDP User" `
+          -PasswordNeverExpires
+      }
+
+      Add-LocalGroupMember `
+        -Group "Remote Desktop Users" `
+        -Member $Username `
+        -ErrorAction SilentlyContinue
+
+      # Administrador local não é necessário para usar RDP.
+      # Não concede privilégios administrativos extras.
+
+      Write-Host "Conta RDP pronta: $Username"
+
+  - name: Verify User
+    shell: powershell
+    run: |
+      $ErrorActionPreference = "Stop"
+
+      $User = Get-LocalUser -Name "RemoteUser"
+
+      if (!$User -or !$User.Enabled) {
+        throw "A conta RemoteUser não está disponível."
+      }
+
+      Write-Host "Conta habilitada:"
+      Write-Host $User.Name
+
+  - name: Install Tailscale
+    shell: powershell
+    run: |
+      $ErrorActionPreference = "Stop"
+
+      $Installer = Join-Path $env:TEMP "tailscale.msi"
+
+      Invoke-WebRequest `
+        -Uri "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi" `
+        -OutFile $Installer
+
+      $Process = Start-Process `
+        -FilePath "msiexec.exe" `
+        -ArgumentList "/i `"$Installer`" /quiet /norestart" `
+        -Wait -PassThru
+
+      Remove-Item $Installer -Force -ErrorAction SilentlyContinue
+
+      if ($Process.ExitCode -notin @(0, 3010)) {
+        throw "Falha na instalação do Tailscale: $($Process.ExitCode)"
+      }
+
+  - name: Connect Tailscale
+    shell: powershell
+    env:
+      TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+    run: |
+      $ErrorActionPreference = "Stop"
+
+      if ([string]::IsNullOrWhiteSpace($env:TAILSCALE_AUTH_KEY)) {
+        throw "Configure o GitHub Secret TAILSCALE_AUTH_KEY."
+      }
+
+      $Tailscale = "$env:ProgramFiles\Tailscale\tailscale.exe"
+
+      if (!(Test-Path $Tailscale)) {
+        throw "Tailscale não encontrado."
+      }
+
+      & $Tailscale up `
+        --authkey="$env:TAILSCALE_AUTH_KEY" `
+        --hostname="github-rdp-$env:GITHUB_RUN_ID"
+
+      if ($LASTEXITCODE -ne 0) {
+        throw "Não foi possível conectar ao Tailscale."
+      }
+
+      Start-Sleep -Seconds 10
+
+      $IP = (& $Tailscale ip -4 | Select-Object -First 1).Trim()
+
+      if (!$IP) {
+        throw "IP Tailscale não encontrado."
+      }
+
+      "TAILSCALE_IP=$IP" >> $env:GITHUB_ENV
+
+      Write-Host "IP Tailscale: $IP"
+
+  - name: Verify RDP Port
+    shell: powershell
+    run: |
+      $ErrorActionPreference = "Stop"
+
+      $Listening = Get-NetTCPConnection `
+        -LocalPort 3389 `
+        -State Listen `
+        -ErrorAction SilentlyContinue
+
+      if (!$Listening) {
+        throw "O Windows não está escutando na porta 3389."
+      }
+
+      Write-Host "Porta RDP 3389 em escuta."
+
+  - name: Connection Information
+    shell: powershell
+    env:
+      RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+    run: |
+      Write-Host ""
+      Write-Host "========== RDP DISPONIVEL =========="
+      Write-Host "ENDERECO: $env:TAILSCALE_IP"
+      Write-Host "USUARIO: .\RemoteUser"
+      Write-Host "SENHA: definida no Secret RDP_PASSWORD"
+      Write-Host "PORTA: 3389"
+      Write-Host "===================================="
+
+  - name: Keep RDP Online
+    shell: powershell
+    run: |
+      while ($true) {
+        Write-Host "[$(Get-Date -Format 'HH:mm:ss')] Verificando sessão..."
+
+        $Service = Get-Service -Name TermService
+
+        if ($Service.Status -ne "Running") {
+          Start-Service -Name TermService
+        }
+
+        Start-Sleep -Seconds 60
+      }
